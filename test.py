@@ -11,9 +11,9 @@ if __name__ == "__main__":
     print("========================================")
     
     N = 4096
-    x = torch.randn(1024, N, dtype=torch.float32)
-    w = torch.randn(N, dtype=torch.float32)
-    b = torch.randn(N, dtype=torch.float32)
+    x = torch.randn(1024, N, dtype=torch.float32, device='cuda')
+    w = torch.randn(N, dtype=torch.float32, device='cuda')
+    b = torch.randn(N, dtype=torch.float32, device='cuda')
     
     # 第一次运行，触发 JIT 编译和模型加载
     print("\n>>> 第一次调用 custom_swish (预期触发模型伴随编译):")
