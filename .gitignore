@@ -2,6 +2,9 @@
 models/
 checkpoints/
 
+# Ignore logs
+*.log
+
 # Ignore compiled objects and sandbox temp files
 *.so
 *.o
