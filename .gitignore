@@ -1,0 +1,16 @@
+# Ignore models directory
+models/
+checkpoints/
+
+# Ignore compiled objects and sandbox temp files
+*.so
+*.o
+*.pyc
+__pycache__/
+agent_workdir/
+build/
+.rocm_jit_agent_cache/
+
+# Ignore IDE files
+.vscode/
+.idea/
