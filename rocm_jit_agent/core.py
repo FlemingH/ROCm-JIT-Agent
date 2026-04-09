@@ -266,7 +266,7 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b"):
                             import subprocess
                             import json
                             
-                            clean_source_code = "\n".join([line for line in source_code.split("\n") if not line.strip().startswith("@rocm_jit_agent")])
+                            clean_source_code = "\n".join([line for line in source_code.split("\n") if not line.strip().startswith("@rocm_jit_agent") and not line.strip().startswith("@optimize")])
                             
                             import re
                             sig_match = re.search(r'(torch::Tensor\s+optimized_func\s*\([^)]*\))', code_to_exec)
