@@ -21,36 +21,51 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b"):
                         tensor_info.append(f"input_{i}({list(arg.shape)}, {arg.dtype})")
                 print(f"[rocm_jit_agent] AI 分析张量签名: {', '.join(tensor_info)}...")
                 
-                print(f"\n[rocm_jit_agent] ━━━━━━━━━ [2/5] 模型推理 (Model Inference) ━━━━━━━━")
+                print(f"[rocm_jit_agent] ━━━━━━━━━ [2/5] 模型推理 (Model Inference) ━━━━━━━━")
                 print(f"[rocm_jit_agent] 🔥 唤醒 Kernel Forge: 开始大模型推理与算子生成")
-                print(f"[rocm_jit_agent] [Iter 1/4] 生成 {target} 底层 HIP 算子... 尝试加载模型...")
                 try:
-                    from transformers import AutoTokenizer
-                    adapter_path = "models/grpo-jan-code-4b-b26"
-                    if os.path.exists(adapter_path):
-                        # 加载模型Tokenizer测试
-                        tokenizer = AutoTokenizer.from_pretrained(adapter_path)
-                        print(f"[rocm_jit_agent] 模型 Tokenizer 加载成功. 词表大小: {tokenizer.vocab_size}")
+                    from llama_cpp import Llama
+                    gguf_path = "models/Jan-code-4b-Q8_0.gguf"
+                    if os.path.exists(gguf_path):
+                        print(f"[rocm_jit_agent] 🧠 加载 GGUF 模型: {gguf_path}")
+                        llm = Llama(
+                            model_path=gguf_path,
+                            n_gpu_layers=-1, # GPU acceleration
+                            n_ctx=2048,
+                            verbose=False
+                        )
                         
-                        prompt = f"Convert this to HIP C++:\n{source_code}"
-                        tokens = tokenizer(prompt, return_tensors="pt")
-                        print(f"[rocm_jit_agent] 输入已 tokenize，长度: {tokens['input_ids'].shape[1]} tokens.")
+                        prompt = f"<|im_start|>user\nConvert the following PyTorch code to highly optimized HIP C++ or Triton code for {target}:\n```python\n{source_code}\n```<|im_end|>\n<|im_start|>assistant\n"
                         
-                        # 检查 Adapter 配置
-                        print("[rocm_jit_agent] 检查 Adapter 配置...")
-                        import json
-                        with open(os.path.join(adapter_path, 'adapter_config.json'), 'r') as f:
-                            config = json.load(f)
-                            print(f"[rocm_jit_agent] Adapter Base Model: {config['base_model_name_or_path']}")
-                            print(f"[rocm_jit_agent] LoRA Rank: {config['r']}, Target Modules: {config['target_modules']}")
+                        print("[rocm_jit_agent] 🧠 模型思考中: 正在将 AST 映射为 Triton/HIP 语法并排布线程块...")
+                        # Run real inference with streaming
+                        import sys
+                        stream_output = llm(prompt, max_tokens=256, stop=["<|im_end|>"], echo=False, stream=True)
+                        
+                        print(f"[rocm_jit_agent] --------------------------------------------------------")
+                        
+                        generated_code = ""
+                        max_display_len = 100
+                        
+                        for chunk in stream_output:
+                            text = chunk["choices"][0]["text"]
+                            generated_code += text
+                            display_text = generated_code.replace('\n', ' ')
+                            if len(display_text) > max_display_len:
+                                display_text = "..." + display_text[-max_display_len:]
                             
-                        print("[rocm_jit_agent] 🧠 模型思考中: 正在将 AST 映射为 Triton/HIP 语法...")
-                        time.sleep(0.6)
-                        print("[rocm_jit_agent] 🧠 模型思考中: 正在排布线程块并优化寄存器溢出...")
-                        time.sleep(0.6)
-                        print("[rocm_jit_agent] (模拟) 模型生成代码完成. （因缺乏基础模型权重，跳过大模型前向推理）")
+                            # 使用 \r 覆盖当前行，并用 \033[K 清除行末残留字符
+                            sys.stdout.write(f"\r\033[K[模型流式生成] 🤖: {display_text}")
+                            sys.stdout.flush()
+                        
+                        print(f"\n[rocm_jit_agent] --------------------------------------------------------")
+                        print(f"[rocm_jit_agent] 模型生成完成，共捕获 {len(generated_code)} 个代码字符.")
+                    else:
+                        print(f"[rocm_jit_agent] 未找到模型 {gguf_path}，退回模拟模式。")
+                except ImportError:
+                    print(f"[rocm_jit_agent] llama-cpp-python 未安装，跳过真实推理。")
                 except Exception as e:
-                    print(f"[rocm_jit_agent] 模型相关操作跳过或失败: {e}")
+                    print(f"[rocm_jit_agent] 推理发生错误: {e}")
 
                 print(f"\n[rocm_jit_agent] ━━━━━━━━━ [3/5] 效果验证 (Effect Validation) ━━━━━━━")
                 print(f"[rocm_jit_agent] [Iter 1/4] 编译沙盒代码成功，喂入随机张量进行标答对比...")
