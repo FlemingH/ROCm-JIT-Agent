@@ -5,40 +5,12 @@ import tempfile
 import csv
 from pathlib import Path
 
-def analyze_kernel_performance(code_str, tensor_infos):
+def analyze_kernel_performance(eval_path):
     """
-    Run rocprofv3 on the generated Triton kernel to extract hardware counters.
-    tensor_infos is a list of dicts: [{'shape': [1024, 4096], 'dtype': 'torch.float32'}, ...]
+    Run rocprofv3 on the generated python script to extract hardware counters of the HIP kernel.
     """
-    script_content = f"""import torch
-import triton
-import triton.language as tl
-
-{code_str}
-
-if __name__ == '__main__':
-    args = []
-"""
-    for t in tensor_infos:
-        shape_str = str(t['shape'])
-        dtype_str = t['dtype']
-        script_content += f"    args.append(torch.randn({shape_str}, dtype={dtype_str}, device='cuda'))\n"
-        
-    script_content += """
-    candidate = optimized_func
-    try:
-        for _ in range(3): candidate(*args)
-        torch.cuda.synchronize()
-        candidate(*args)
-        torch.cuda.synchronize()
-    except Exception as e:
-        pass
-"""
-
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
-        script_path = tmpdir_path / "bench.py"
-        script_path.write_text(script_content)
         
         input_txt = tmpdir_path / "rocprof_input.txt"
         input_txt.write_text("pmc: SQ_WAVES_sum SQ_INSTS_VALU_sum\npmc: GL2C_HIT_sum GL2C_MISS_sum GL2C_MC_RDREQ_sum\n")
@@ -47,15 +19,14 @@ if __name__ == '__main__':
         
         env = os.environ.copy()
         # Ensure we run in a clean environment for profiling
-        cmd = ["rocprofv3", "-i", str(input_txt), "--kernel-trace", "-o", str(out_prefix), "-f", "csv", "--", sys.executable, str(script_path)]
+        cmd = ["rocprofv3", "-i", str(input_txt), "--kernel-trace", "-o", str(out_prefix), "-f", "csv", "--", sys.executable, str(eval_path)]
         
         try:
-            res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+            res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)
         except subprocess.TimeoutExpired:
             return "rocprofv3 profiling timed out."
             
         if res.returncode != 0:
-            # If it failed to run rocprofv3
             return f"rocprofv3 failed to run properly. Output: {res.stderr[-200:]}"
             
         metrics = {}
@@ -65,7 +36,7 @@ if __name__ == '__main__':
             with open(cc_path) as f:
                 for row in csv.DictReader(f):
                     kname = row.get("Kernel_Name", "")
-                    if "fused_kernel" not in kname: continue
+                    if "fused_kernel" not in kname and "optimized_func" not in kname: continue
                     cname = row.get("Counter_Name", "")
                     cval = row.get("Counter_Value", "")
                     if cname and cval:
@@ -84,7 +55,7 @@ if __name__ == '__main__':
             with open(kt_path) as f:
                 for row in csv.DictReader(f):
                     kname = row.get("Kernel_Name", "")
-                    if "fused_kernel" not in kname: continue
+                    if "fused_kernel" not in kname and "optimized_func" not in kname: continue
                     for col in ["VGPR_Count", "SGPR_Count", "Workgroup_Size"]:
                         v = row.get(col, "")
                         if v and col not in metrics:
@@ -92,7 +63,7 @@ if __name__ == '__main__':
                             except ValueError: pass
 
         if not metrics:
-            return "No profiling metrics collected (kernel might not have executed properly during profiling)."
+            return "No profiling metrics collected (kernel might not have executed properly during profiling or name mismatch)."
 
         gl2c_hit = metrics.get("GL2C_HIT_sum", 0)
         gl2c_miss = metrics.get("GL2C_MISS_sum", 0)
