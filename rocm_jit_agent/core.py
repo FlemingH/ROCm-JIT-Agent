@@ -23,6 +23,8 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1", force_
                         tensor_info_strs.append(f"{arg_name}({list(arg.shape)}, {arg.dtype})")
                         tensor_infos_for_prof.append({'shape': list(arg.shape), 'dtype': str(arg.dtype)})
                 cpp_arg_str = ", ".join([f"torch::Tensor {name}" for name in arg_names[:len(args)]])
+                kernel_ptr_args = ", ".join([f"float* {name}_ptr" for name in arg_names[:len(args)]])
+                launch_data_ptrs = ", ".join([f"{name}.data_ptr<float>()" for name in arg_names[:len(args)]])
                 
                 eager_us = 0.0
                 compile_us = 0.0
@@ -140,7 +142,7 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1", force_
                             f"```cpp\n"
                             f"#include <torch/extension.h>\n"
                             f"#include <hip/hip_runtime.h>\n\n"
-                            f"__global__ void fused_kernel(float* output_ptr, /* POINTER ARGS HERE */, int n_elements) {{\n"
+                            f"__global__ void fused_kernel(float* output_ptr, {kernel_ptr_args}, int n_elements) {{\n"
                             f"    int pid = blockIdx.x * blockDim.x + threadIdx.x;\n"
                             f"    if (pid < n_elements) {{\n"
                             f"        // DO MATH HERE\n"
@@ -152,7 +154,7 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1", force_
                             f"    int n_elements = output.numel();\n"
                             f"    int threads = 256;\n"
                             f"    int blocks = (n_elements + threads - 1) / threads;\n"
-                            f"    hipLaunchKernelGGL(fused_kernel, dim3(blocks), dim3(threads), 0, 0, output.data_ptr<float>(), /* USE .data_ptr<float>() ON YOUR OTHER TENSOR ARGS */, n_elements);\n"
+                            f"    hipLaunchKernelGGL(fused_kernel, dim3(blocks), dim3(threads), 0, 0, output.data_ptr<float>(), {launch_data_ptrs}, n_elements);\n"
                             f"    return output;\n"
                             f"}}\n"
                             f"```\n\n"
@@ -163,17 +165,22 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1", force_
                             messages.append({"role": "user", "content": user_msg})
                         else:
                             clean_feedback = str(feedback).strip()
-                            if "error" in clean_feedback.lower():
-                                lines = clean_feedback.split('\n')
-                                clean_feedback = "\n".join([l for l in lines if "error" in l.lower() or "line " in l.lower() or "File " in l][-5:])
+                            # Only apply error-line filtering for compilation/runtime errors
+                            # For performance feedback (profiler data), keep full context
+                            if "Execution or validation error" in clean_feedback or "ERROR" in clean_feedback:
+                                fb_lines = clean_feedback.split('\n')
+                                error_lines = [l for l in fb_lines if "error" in l.lower() or "line " in l.lower() or "File " in l]
+                                if error_lines:
+                                    clean_feedback = "\n".join(error_lines[-10:])
+                            # Truncate only as a last resort
                             if not clean_feedback:
-                                clean_feedback = str(feedback).strip()[:300]
+                                clean_feedback = str(feedback).strip()[:500]
                                 
                             messages.append({"role": "user", "content": user_msg})
                             messages.append({"role": "assistant", "content": f"```cpp\n{generated_code}\n```"})
                             messages.append({
                                 "role": "user", 
-                                "content": f"The kernel above failed or is too slow with this feedback:\n```\n{clean_feedback}\n```\n\nPlease fix the errors, optimize it further, and output the corrected valid C++ code. Return ONLY code."
+                                "content": f"The kernel above has this issue:\n```\n{clean_feedback}\n```\n\nPlease analyze the feedback above carefully and fix all issues. Return ONLY the corrected C++ code."
                             })
                             
                         try:
@@ -276,7 +283,10 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1", force_
             mse = 0.0
             
         if mse > 1e-3:
-            print(f"ERROR: Output correctness validation failed (MSE={mse:.5f}). Fix the logic bugs.")
+            # Show sample values to help the model understand what went wrong
+            flat_e = out_eager.flatten()[:5]
+            flat_o = out_opt.flatten()[:5]
+            print(f"ERROR: Output correctness validation failed (MSE={mse:.5f}). Expected first 5 values: {flat_e.tolist()}, got: {flat_o.tolist()}. The mathematical logic is incorrect.")
             sys.exit(1)
             
         start_event = torch.cuda.Event(enable_timing=True)
@@ -316,7 +326,14 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1", force_
                                     # Extract ninja/hipcc errors cleanly
                                     if "FAILED: " in error_text:
                                         error_text = error_text[error_text.find("FAILED: "):]
-                                        error_text = error_text.split("\n")[0] # Only keep the first line of the compile error
+                                        # Skip the hipcc command line (very long, not useful for diagnosis)
+                                        # and extract the actual compiler error messages
+                                        error_lines = error_text.split('\n')
+                                        # Filter out the command repeat and keep actual errors
+                                        useful_lines = [l for l in error_lines if not l.strip().startswith('/opt/rocm') and not l.strip().startswith('/home/')]
+                                        if not useful_lines:
+                                            useful_lines = error_lines[2:10]  # fallback: skip FAILED + command
+                                        error_text = '\n'.join(useful_lines[:10])
                                         
                                     if "incompatible function arguments" in error_text:
                                         error_text = error_text.split("Invoked with:")[0]
@@ -328,8 +345,11 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1", force_
                                 if not output_parts and res_stdout.strip().split("\n")[-1].startswith("SUCCESS:"):
                                     output_parts = [res_stdout.strip().split("\n")[-1]]
                                 
+                                if not output_parts:
+                                    raise RuntimeError(f"Unexpected subprocess output (no SUCCESS line): {res_stdout[-500:]}")
+                                
                                 success_str = output_parts[-1]
-                                _, mse_str, opt_us_str, build_dir = success_str.split(":")
+                                _, mse_str, opt_us_str, build_dir = success_str.split(":", 3)
                                 opt_us = float(opt_us_str)
                                 
                                 # Now load it back into the main process efficiently
@@ -346,8 +366,12 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1", force_
                                 candidate = module.optimized_func
                                 
                             finally:
-                                if os.path.exists(out_path):
-                                    os.unlink(out_path)
+                                for _tmp in [out_path, eval_path]:
+                                    try:
+                                        if os.path.exists(_tmp):
+                                            os.unlink(_tmp)
+                                    except OSError:
+                                        pass
                             
                             print(f"[rocm_jit_agent] ✅ Validation Passed (MSE={mse_str}). Opt Execution Time: {opt_us:.1f}us")
                             
@@ -364,7 +388,13 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1", force_
                                 from .profiler import analyze_kernel_performance
                                 prof_feedback = analyze_kernel_performance(eval_path)
                                 print(f"[rocm_jit_agent] 📊 rocprofv3 Hardware Feedback:\n{prof_feedback}")
-                                feedback = f"The generated kernel works correctly but takes {opt_us:.1f}us. The target is {target_us:.1f}us. Hardware profiling results:\n{prof_feedback}\nPlease optimize performance: check memory coalescing, block sizes, use float4 vectorized loads/stores, or avoid unnecessary memory reads."
+                                feedback = (
+                                    f"The generated kernel compiles and produces correct results, "
+                                    f"but its execution time is {opt_us:.1f}us, which exceeds the target of {target_us:.1f}us "
+                                    f"(need {opt_us/target_us:.1f}x speedup).\n"
+                                    f"Hardware profiling analysis from rocprofv3:\n{prof_feedback}\n"
+                                    f"Based on the profiling data above, optimize the kernel to meet the performance target."
+                                )
                                 print(f"[rocm_jit_agent] ⚠️ Target not reached. Refining code for next iteration...")
                                 
                         except subprocess.TimeoutExpired:
