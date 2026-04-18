@@ -247,7 +247,8 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1",
 
                             compare_block = sk.build_eval_compare(ctx, sk)
 
-                            eval_script = "import torch, sys, os, traceback\n"
+                            eval_script = "import torch, sys, os, math, traceback\n"
+                            eval_script += "import torch.nn.functional as F\n"
                             eval_script += "from torch.utils.cpp_extension import load_inline\n"
                             eval_script += f"os.environ['PYTORCH_ROCM_ARCH'] = '{target}'\n"
                             eval_script += "MSE_THRESH = 1e-3\n"
