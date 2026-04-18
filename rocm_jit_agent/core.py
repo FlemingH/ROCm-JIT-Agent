@@ -17,14 +17,54 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1", force_
                 arg_names = list(inspect.signature(func).parameters.keys())
                 tensor_info_strs = []
                 tensor_infos_for_prof = []
+                
+                # Separate tensor args from scalar args
+                tensor_args = []
+                scalar_args = []
                 for i, arg in enumerate(args):
+                    name = arg_names[i] if i < len(arg_names) else f"input_{i}"
                     if isinstance(arg, torch.Tensor):
-                        arg_name = arg_names[i] if i < len(arg_names) else f"input_{i}"
-                        tensor_info_strs.append(f"{arg_name}({list(arg.shape)}, {arg.dtype})")
-                        tensor_infos_for_prof.append({'shape': list(arg.shape), 'dtype': str(arg.dtype)})
-                cpp_arg_str = ", ".join([f"torch::Tensor {name}" for name in arg_names[:len(args)]])
-                kernel_ptr_args = ", ".join([f"float* {name}_ptr" for name in arg_names[:len(args)]])
-                launch_data_ptrs = ", ".join([f"{name}.data_ptr<float>()" for name in arg_names[:len(args)]])
+                        tensor_args.append((name, arg))
+                        tensor_info_strs.append(f"{name}({list(arg.shape)}, {arg.dtype})")
+                        tensor_infos_for_prof.append({"shape": list(arg.shape), "dtype": str(arg.dtype)})
+                    else:
+                        scalar_args.append((name, arg))
+                
+                # Map PyTorch dtypes to C types
+                def dtype_to_ctype(dtype):
+                    mapping = {
+                        torch.float32: "float", torch.float64: "double",
+                        torch.float16: "at::Half", torch.bfloat16: "at::BFloat16",
+                        torch.int32: "int", torch.int64: "long", torch.int16: "short",
+                        torch.int8: "int8_t", torch.uint8: "uint8_t", torch.bool: "bool",
+                    }
+                    return mapping.get(dtype, "float")
+                
+                def scalar_to_ctype(val):
+                    if isinstance(val, bool): return "bool"
+                    if isinstance(val, int): return "int"
+                    if isinstance(val, float): return "float"
+                    return "float"
+                
+                scalar_args_info = [(name, val) for name, val in scalar_args]
+                
+                # Build C++ function signature parts
+                cpp_tensor_args = [f"torch::Tensor {name}" for name, _ in tensor_args]
+                cpp_scalar_args = [f"{scalar_to_ctype(val)} {name}" for name, val in scalar_args]
+                cpp_arg_str = ", ".join(cpp_tensor_args + cpp_scalar_args)
+                
+                # Build kernel pointer args (tensors become pointers, scalars pass through)
+                kernel_ptr_parts = []
+                launch_ptr_parts = []
+                for name, t in tensor_args:
+                    ctype = dtype_to_ctype(t.dtype)
+                    kernel_ptr_parts.append(f"{ctype}* {name}_ptr")
+                    launch_ptr_parts.append(f"{name}.data_ptr<{ctype}>()")
+                for name, val in scalar_args:
+                    kernel_ptr_parts.append(f"{scalar_to_ctype(val)} {name}")
+                    launch_ptr_parts.append(name)
+                kernel_ptr_args = ", ".join(kernel_ptr_parts)
+                launch_data_ptrs = ", ".join(launch_ptr_parts)
                 
                 eager_us = 0.0
                 compile_us = 0.0
@@ -60,7 +100,8 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1", force_
                 import hashlib
                 cache_dir = os.path.expanduser("~/.rocm_jit_agent_cache")
                 os.makedirs(cache_dir, exist_ok=True)
-                func_hash = hashlib.md5((source_code + str(target)).encode('utf-8')).hexdigest()
+                shape_sig = str([(list(a.shape), str(a.dtype)) for a in args if isinstance(a, torch.Tensor)])
+                func_hash = hashlib.md5((source_code + str(target) + shape_sig).encode('utf-8')).hexdigest()
                 cache_cpp = os.path.join(cache_dir, f"{func_hash}.cpp")
                 cache_sig = os.path.join(cache_dir, f"{func_hash}_sig.cpp")
                 
@@ -130,13 +171,19 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1", force_
                             {"role": "system", "content": "You are an expert AMD GPU optimization engineer. You specialize in rewriting PyTorch code into highly optimized HIP C++ kernels."},
                         ]
                         
+                        # Build concrete broadcast examples from actual tensor shapes
+                        broadcast_hints = []
+                        for bname, bt in tensor_args:
+                            if bt.dim() == 1:
+                                broadcast_hints.append(f"  - {bname} has shape {list(bt.shape)}: use `pid % {bt.shape[-1]}` to index it")
+                        broadcast_hint = "\n".join(broadcast_hints) if broadcast_hints else ""
                         user_msg = (
                             f"Convert the following PyTorch code to a highly optimized HIP C++ kernel for AMD GPU ({target}).\n"
                             f"Requirements:\n"
                             f"1. Return ONLY valid C++ code.\n"
                             f"2. You must implement the corresponding operations correctly based on the tensor shapes.\n"
                             f"Here are the tensor signatures: {', '.join(tensor_info_strs)}\n"
-                            f"3. IMPORTANT: For 1D tensors (e.g. bias, weight), you must use modulo indexing like `pid % 4096` if `pid` is larger than the 1D tensor's dimension, or broadcast correctly depending on the logic.\n"
+                            f"3. IMPORTANT: For 1D tensors, you must broadcast correctly using modulo indexing.\n{broadcast_hint}\n"
                             f"4. You MUST implement `torch::Tensor optimized_func(...)` taking EXACTLY the following arguments: {cpp_arg_str}.\n"
                             f"5. You must use this skeleton pattern:\n\n"
                             f"```cpp\n"
@@ -264,7 +311,12 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1", force_
                             for t in tensor_infos_for_prof:
                                 shape_str = str(t['shape'])
                                 dtype_str = t['dtype']
-                                eval_script += f"        args.append(torch.randn({shape_str}, dtype={dtype_str}, device='cuda'))\n"
+                                if 'int' in dtype_str or 'bool' in dtype_str:
+                                    eval_script += f"        args.append(torch.randint(0, 10, {shape_str}, dtype={dtype_str}, device='cuda'))\n"
+                                else:
+                                    eval_script += f"        args.append(torch.randn({shape_str}, dtype={dtype_str}, device='cuda'))\n"
+                            for sname, sval in scalar_args_info:
+                                eval_script += f"        args.append({repr(sval)})\n"
                                 
                             eval_script += """
         out_eager = original_func(*args)
