@@ -13,6 +13,56 @@ from .skeletons import (
 )
 
 
+def _robust_bench_us(fn, warmup_iters=25, rep=100, n_rounds=5):
+    """Steady-state GPU timing in microseconds. Returns the MEDIAN of n_rounds
+    measurement windows of `rep` iterations each, after `warmup_iters` warmup
+    calls. Generic — knows nothing about shapes, dtypes, or kernel internals.
+
+    Replaces the previous single-shot for-loop timing which suffered from cold
+    cache / context-init bias (see example/stability_test.py)."""
+    for _ in range(warmup_iters):
+        fn()
+    torch.cuda.synchronize()
+    samples = []
+    for _ in range(n_rounds):
+        s_evt = torch.cuda.Event(enable_timing=True)
+        e_evt = torch.cuda.Event(enable_timing=True)
+        s_evt.record()
+        for _ in range(rep):
+            fn()
+        e_evt.record()
+        torch.cuda.synchronize()
+        samples.append(s_evt.elapsed_time(e_evt) / rep * 1000.0)
+    samples.sort()
+    return samples[len(samples) // 2]
+
+
+# Per-dtype absolute-error tolerance for validation. Lowest-precision input
+# tensor sets the threshold (matmul gets a separate, looser one because of
+# accumulator drift across long reductions).
+_DTYPE_MSE_THRESH = {
+    "torch.float64": 1e-6,
+    "torch.float32": 1e-3,
+    "torch.float16": 5e-2,
+    "torch.bfloat16": 1e-1,
+    "torch.int64":   0.0,
+    "torch.int32":   0.0,
+    "torch.int16":   0.0,
+    "torch.int8":    0.0,
+    "torch.uint8":   0.0,
+    "torch.bool":    0.0,
+}
+
+
+def _pick_mse_threshold(tensor_infos):
+    """Choose MSE threshold from the *least* precise input dtype."""
+    if not tensor_infos:
+        return 1e-3
+    dtypes = [t["dtype"] for t in tensor_infos]
+    # rank: more permissive wins
+    return max(_DTYPE_MSE_THRESH.get(d, 1e-3) for d in dtypes)
+
+
 def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1",
              force_recompile=False, skeleton=None):
     """JIT-compile a PyTorch function into an optimized HIP kernel.
@@ -61,37 +111,22 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1",
                     scalar_args=scalar_args,
                     arg_names=arg_names,
                 )
-                sk = classify(ctx, user_hint=skeleton)
-                print(f"[rocm_jit_agent] 🧩 Selected skeleton: {sk.name} ({sk.description})")
+                sk, sk_conf, sk_reason = classify(ctx, user_hint=skeleton)
+                print(f"[rocm_jit_agent] 🧩 Selected skeleton: {sk.name} (confidence={sk_conf:.2f} — {sk_reason})")
+                if sk_conf < 0.5:
+                    print(f"[rocm_jit_agent] ⚠️  LOW CLASSIFIER CONFIDENCE — the chosen skeleton may not fit this op."
+                          f" Generated kernel will still be validated against PyTorch reference,"
+                          f" but consider passing skeleton=... explicitly.")
 
                 # Build C++ function signature (used for subprocess sig extraction)
                 cpp_tensor_args = [f"torch::Tensor {name}" for name, _ in tensor_args]
                 cpp_scalar_args = [f"{scalar_to_ctype(val)} {name}" for name, val in scalar_args]
                 cpp_arg_str = ", ".join(cpp_tensor_args + cpp_scalar_args)
 
-                eager_us = 0.0
-                compile_us = 0.0
-
-                try:
-                    import triton.testing
-                    eager_ms = triton.testing.do_bench(lambda: func(*args, **kwargs))
-                    eager_us = eager_ms * 1000
-                except ImportError:
-                    start_event = torch.cuda.Event(enable_timing=True)
-                    end_event = torch.cuda.Event(enable_timing=True)
-                    for _ in range(3): func(*args, **kwargs)
-                    start_event.record()
-                    for _ in range(10): func(*args, **kwargs)
-                    end_event.record()
-                    torch.cuda.synchronize()
-                    eager_us = start_event.elapsed_time(end_event) / 10.0 * 1000
-
+                eager_us = _robust_bench_us(lambda: func(*args, **kwargs))
                 try:
                     compiled_func = torch.compile(func)
-                    import triton.testing
-                    for _ in range(3): compiled_func(*args, **kwargs)
-                    compile_ms = triton.testing.do_bench(lambda: compiled_func(*args, **kwargs))
-                    compile_us = compile_ms * 1000
+                    compile_us = _robust_bench_us(lambda: compiled_func(*args, **kwargs))
                 except Exception:
                     compile_us = eager_us
 
@@ -251,8 +286,11 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1",
                             eval_script += "import torch.nn.functional as F\n"
                             eval_script += "from torch.utils.cpp_extension import load_inline\n"
                             eval_script += f"os.environ['PYTORCH_ROCM_ARCH'] = '{target}'\n"
-                            eval_script += "MSE_THRESH = 1e-3\n"
-                            eval_script += "MATMUL_MSE_THRESH = 1e-1\n"
+                            _mse_thresh = _pick_mse_threshold(tensor_infos_for_prof)
+                            # matmul reductions inflate accumulator error → loosen
+                            _matmul_mse_thresh = max(_mse_thresh, 1e-1)
+                            eval_script += f"MSE_THRESH = {_mse_thresh}\n"
+                            eval_script += f"MATMUL_MSE_THRESH = {_matmul_mse_thresh}\n"
                             eval_script += f"# --- Original Code ---\n{clean_source_code}\noriginal_func = {func.__name__}\n\n"
                             eval_script += f"cpp_source = \"\"\"\n{code_to_exec}\n\"\"\"\n"
                             eval_script += f"cpp_sig = \"\"\"{cpp_sig}\"\"\"\n"
@@ -286,15 +324,20 @@ def optimize(target="gfx1100", backend="local:Jan-code-4b-gfx1100-HIP-1",
                             # indent the skeleton's compare block into the try branch
                             import textwrap as _tw
                             eval_script += _tw.indent(compare_block, "        ")
-                            eval_script += "        start_event = torch.cuda.Event(enable_timing=True)\n"
-                            eval_script += "        end_event = torch.cuda.Event(enable_timing=True)\n"
-                            eval_script += "        for _ in range(3): candidate(*args)\n"
+                            eval_script += "        # robust steady-state timing: warmup + median of N windows\n"
+                            eval_script += "        for _ in range(25): candidate(*args)\n"
                             eval_script += "        torch.cuda.synchronize()\n"
-                            eval_script += "        start_event.record()\n"
-                            eval_script += "        for _ in range(10): candidate(*args)\n"
-                            eval_script += "        end_event.record()\n"
-                            eval_script += "        torch.cuda.synchronize()\n"
-                            eval_script += "        opt_us = start_event.elapsed_time(end_event) / 10.0 * 1000\n"
+                            eval_script += "        _samples = []\n"
+                            eval_script += "        for _round in range(5):\n"
+                            eval_script += "            _s = torch.cuda.Event(enable_timing=True)\n"
+                            eval_script += "            _e = torch.cuda.Event(enable_timing=True)\n"
+                            eval_script += "            _s.record()\n"
+                            eval_script += "            for _ in range(100): candidate(*args)\n"
+                            eval_script += "            _e.record()\n"
+                            eval_script += "            torch.cuda.synchronize()\n"
+                            eval_script += "            _samples.append(_s.elapsed_time(_e) / 100.0 * 1000.0)\n"
+                            eval_script += "        _samples.sort()\n"
+                            eval_script += "        opt_us = _samples[len(_samples)//2]\n"
                             eval_script += "        print(f'SUCCESS:0.00000:{opt_us:.2f}:{build_dir}')\n"
                             eval_script += "    except Exception as e:\n"
                             eval_script += "        import traceback\n"

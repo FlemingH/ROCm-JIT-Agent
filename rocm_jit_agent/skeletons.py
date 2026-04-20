@@ -416,8 +416,28 @@ def _count_return_values(source: str) -> int:
     return max(1, len(parts))
 
 
-def classify(ctx: SkeletonContext, user_hint: Optional[str] = None) -> Skeleton:
-    """Pick a skeleton. `user_hint` from decorator overrides auto-detect."""
+# Source-code patterns whose semantics no current skeleton can express
+# (sequential data dependency along a reduction axis, indirect indexing, etc.).
+# When seen inside an otherwise-elementwise function, confidence drops sharply.
+_DATA_DEP_PATTERNS = (
+    r"torch\.cumsum\b", r"torch\.cumprod\b", r"torch\.cummax\b", r"torch\.cummin\b",
+    r"\.cumsum\s*\(", r"\.cumprod\s*\(",
+    r"torch\.sort\b", r"torch\.argsort\b", r"torch\.unique\b",
+    r"torch\.scatter\b", r"torch\.gather\b", r"\.scatter_?\s*\(", r"\.gather\s*\(",
+    r"torch\.nonzero\b", r"torch\.where\s*\(\s*[^,]+\s*\)",  # 1-arg where = nonzero
+)
+
+
+def classify(ctx: SkeletonContext, user_hint: Optional[str] = None):
+    """Pick a skeleton. Returns (skeleton, confidence, reason).
+
+    confidence in [0,1]:
+      1.00 - explicit user hint
+      0.90 - strong structural match (multi-output / matmul w/ 2D / reduction-with-dim)
+      0.50 - default fall-through (no positive signal)
+      <=0.30 - default fall-through but source contains data-dependency patterns
+              that no current skeleton supports (silent-correctness risk).
+    """
     name_map = {
         "elementwise_1d": ELEMENTWISE_1D,
         "elementwise": ELEMENTWISE_1D,
@@ -434,27 +454,30 @@ def classify(ctx: SkeletonContext, user_hint: Optional[str] = None) -> Skeleton:
         sk = name_map[key]
         if sk is MULTI_OUTPUT:
             sk = _attach_n_outputs(sk, _count_return_values(ctx.source_code))
-        return sk
+        return sk, 1.0, f"user hint={user_hint!r}"
 
     src = ctx.source_code
 
-    # Multi-output detection (highest priority since it wraps other patterns)
     n_out = _count_return_values(src)
     if n_out > 1:
-        return _attach_n_outputs(MULTI_OUTPUT, n_out)
+        return _attach_n_outputs(MULTI_OUTPUT, n_out), 0.9, f"detected {n_out} return values"
 
-    # Matmul
     if re.search(r"torch\.matmul\s*\(|torch\.mm\s*\(|\s@\s", src):
         if len(ctx.tensor_args) >= 2 and all(t.dim() >= 2 for _, t in ctx.tensor_args[:2]):
-            return MATMUL_2D
+            return MATMUL_2D, 0.9, "matmul/@/mm op with >=2D tensors"
 
-    # Row reduction (sum/mean/max along a dim)
     if re.search(r"\.(sum|mean|max|min|prod|norm)\s*\(\s*dim\s*=", src):
         first_t = ctx.tensor_args[0][1] if ctx.tensor_args else None
         if first_t is not None and first_t.dim() >= 2:
-            return ROW_REDUCTION
+            return ROW_REDUCTION, 0.9, "reduction-with-dim on >=2D tensor"
 
-    return ELEMENTWISE_1D
+    # Fall through to elementwise. Check if the source contains semantics the
+    # elementwise skeleton genuinely cannot express — if so emit low confidence.
+    for pat in _DATA_DEP_PATTERNS:
+        if re.search(pat, src):
+            return ELEMENTWISE_1D, 0.3, f"no skeleton matches; source contains data-dep pattern /{pat}/"
+
+    return ELEMENTWISE_1D, 0.5, "default fall-through (no positive signal)"
 
 
 def _attach_n_outputs(sk: Skeleton, n: int) -> Skeleton:
