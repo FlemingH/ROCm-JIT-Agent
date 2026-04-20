@@ -1,379 +1,405 @@
 # ROCm-JIT-Agent：AI-in-the-Loop 本地算子锻造引擎 (Kernel Forge)
 
-> 文档版本：v0.2 · 与代码实现严格对齐  
-> 适配模型：`Jan-code-4b-gfx1100-HIP-1`（4B 参数，本地推理）  
-> 适配硬件：AMD RDNA3 GPU（gfx1100，如 RX 7900 XTX/GRE）
+> 文档版本：v1.0 · 与代码实现严格对齐  
+> 适配模型：`Jan-code-4b-gfx1100-HIP-1`（4B 参数，GRPO 强化学习微调，本地 bfloat16 推理）  
+> 基座模型：`Jan-code-4b`（4B 参数，无 RL，用于消融对比）  
+> 适配硬件：AMD RDNA3 GPU（gfx1100，如 RX 7900 XTX/GRE）  
+> 运行环境：ROCm 7.2.0 · PyTorch 2.9.1+rocm7.2.0 · conda env `ra`
 
 ---
 
 ## 1. 项目定位
 
-ROCm-JIT-Agent 是一个 **PyTorch 装饰器式的本地算子优化引擎**。开发者只需在 PyTorch 函数上加 `@optimize(target="gfx1100")`，引擎会在首次调用时自动：
+ROCm-JIT-Agent 是一个 **PyTorch 装饰器式的本地算子优化引擎**。开发者只需在 PyTorch 函数上加 `@optimize(target="gfx1100")`，引擎在首次调用时自动：
 
 1. 拦截函数，提取源码与张量签名
-2. 用本地 4B 代码模型生成 HIP C++ 内核
-3. 在子进程中编译、执行、对齐精度
-4. 用 `rocprofv3` 提取硬件计数器数据反馈给模型迭代优化
-5. 将通过验证的最佳内核持久化到磁盘缓存
+2. **三层架构**分类任务、选择骨架、生成 prompt
+3. 用本地 4B 代码模型生成 HIP C++ 内核
+4. 确定性后处理（Sanitizer）修复已知模型 surface bug
+5. 子进程沙盒中编译、验证精度、稳态测速
+6. 用 `rocprofv3` 提取硬件计数器反馈模型迭代优化
+7. 将通过验证的最佳内核持久化到磁盘缓存
 
-**设计哲学**：用一次性几十秒的编译等待，换全生命周期 O(1) 的微秒级执行；用本地 4B 小模型替代云端大模型，实现完全离线、隐私安全的算子优化。
+**设计哲学**：用一次性几十秒到几分钟的编译等待，换全生命周期 O(1) 微秒级执行；用本地 4B 小模型替代云端大模型，实现完全离线、隐私安全的算子优化。
 
 ---
 
-## 2. 当前实现概览
+## 2. 项目结构
 
-### 2.1 项目结构
 ```
 rocm_jit_agent/
-  ├── __init__.py        # 暴露 optimize 装饰器
-  ├── core.py            # ~430 行，主流程：拦截→生成→编译→验证→反馈→缓存
-  └── profiler.py        # ~80 行，rocprofv3 包装，提取 VGPR、L2 命中率等指标
-example/
-  ├── example_fusion.py     # fused_gated_activation: (x*weight)*sigmoid(x)+bias
-  └── complex_fusion.py     # complex_math_fusion: 含 log/abs/tanh/pow 的融合
+  ├── __init__.py         # 暴露 optimize 装饰器
+  ├── core.py             # ~450 行，主流程：拦截→分类→生成→后处理→编译→验证→反馈→缓存
+  │                       # 含 _robust_bench_us()、_pick_mse_threshold()、_DTYPE_MSE_THRESH
+  ├── skeletons.py        # ~490 行，Layer 1+2：任务分类器 + 4 个可插拔骨架
+  │                       # 含 classify()、_DATA_DEP_PATTERNS、SkeletonContext、Skeleton
+  ├── sanitizer.py        # ~58 行，Layer 3：确定性代码后处理（3 类规则）
+  └── profiler.py         # ~82 行，rocprofv3 包装，提取 VGPR/L2/occupancy 等指标
+example/                  # 14 个测试例子（覆盖 4 种骨架 × 3 种 dtype × 1D/2D/3D）
+  ├── example_fusion.py            # elementwise_1d, fp32, 2D — baseline fusion
+  ├── complex_fusion.py            # elementwise_1d, fp32, 2D — log/abs/tanh/sigmoid/pow
+  ├── gelu_example.py              # elementwise_1d, fp32, 2D — GELU activation
+  ├── swiglu_example.py            # elementwise_1d, fp32, 2D — SwiGLU activation
+  ├── silu_bf16_example.py         # elementwise_1d, bf16, 2D — bf16 dtype path
+  ├── fp16_example.py              # elementwise_1d, fp16, 2D — fp16 dtype path
+  ├── scaled_activation_example.py # elementwise_1d, fp32, 2D — scalar float args
+  ├── attention_score_3d_example.py# elementwise_1d, fp32, 3D — 3D shape + scalar
+  ├── reduction_example.py         # row_reduction, fp32, 2D — .sum(dim=-1)
+  ├── l2_norm_example.py           # row_reduction, fp32, 2D — sqrt(sum(x²))
+  ├── matmul_example.py            # matmul_2d, fp32, 2D — naive matmul
+  ├── multi_output_example.py      # multi_output, fp32, 1D — (x+y, x-y)
+  ├── unsupported_op_example.py    # 负例：torch.cumsum，触发低置信度警告
+  ├── stability_test.py            # 基准测速方法论验证
+  └── README.md                    # 测试清单、发现、系统问题分析
 models/
-  └── Jan-code-4b-gfx1100-HIP-1/   # GRPO RL 微调的 4B HIP 代码模型
-```
-
-### 2.2 核心数据流
-
-```
-用户调用 @optimize 装饰的函数
-         │
-         ▼
-[1] 拦截 & 签名解析 ──── inspect.getsource + 张量 shape/dtype
-         │
-         ▼
-[2] 缓存查找 ──────────── MD5(源码 + target + shape_sig) → ~/.rocm_jit_agent_cache/
-         │ (miss)
-         ▼
-[3] 基准测速 ──────────── triton.testing.do_bench(eager) + torch.compile
-         │             target_us = min(eager_us, compile_us)
-         ▼
-[4] LLM 生成 ──────────── 4B 模型 + chat template + 流式输出
-         │             prompt 含具体 C++ 骨架（已填充 dtype/shape/参数名）
-         ▼
-[5] 子进程沙盒 ────────── tempfile + subprocess + load_inline (90s 超时)
-         │             先 hipcc 编译，再用 randn 张量做 MSE 验证 + 测速
-         ▼
-[6] 反馈分支 ──────────── 编译失败 → 提取 hipcc error 行
-         │             MSE 不达标 → 注入期望/实际样本值
-         │             性能不达标 → rocprofv3 硬件指标
-         ▼
-[7] 多轮迭代 ──────────── max_iters=10，温度从 0.30 递增到 1.65
-         │             成功后落盘 + 主进程 load_inline 复用 build_dir
-         ▼
-[8] 持久化缓存 ────────── {hash}.cpp + {hash}_sig.cpp
+  ├── Jan-code-4b/                       # 基座模型（无 RL）
+  ├── Jan-code-4b-gfx1100-HIP-1/        # GRPO RL 微调模型（生产用）
+  └── grpo-jan-code-4b-b26/             # RL 训练 adapter 权重与 checkpoints
 ```
 
 ---
 
-## 3. 模型能力评估
+## 3. 三层架构
 
-### 3.1 基础事实
-- **模型**：`Jan-code-4b-gfx1100-HIP-1`，bfloat16 加载，`device_map="auto"` 自动切分
-- **生成参数**：`max_new_tokens=1024`，`top_p=0.95`，温度从 0.3 起每轮递增 0.15
-- **强约束**：`prompt += "\`\`\`cpp\n#include <torch/extension.h>\n#include <hip/hip_runtime.h>\n"` 强制以正确的 C++ 头文件开头
+```
+             ┌──────────────────────────────────┐
+   用户 ───▶ │   @optimize(target, skeleton=?)  │  decorator, 向后兼容
+             └──────────────┬───────────────────┘
+                            │ inspect.getsource + 张量/标量分离
+             ┌──────────────▼───────────────────┐
+  Layer 1 ─▶ │  TaskClassifier (classify())     │  skeletons.py
+             │  源码 regex + shape + 返回值分析  │
+             │  输出：(Skeleton, confidence, reason)
+             └──────────────┬───────────────────┘
+                            │
+             ┌──────────────▼───────────────────┐
+  Layer 2 ─▶ │  SkeletonRegistry (4 骨架)       │  skeletons.py
+             │  build_prompt_block(ctx, sk)      │  → LLM user message
+             │  build_eval_compare(ctx, sk)      │  → 子进程验证脚本
+             └──────────────┬───────────────────┘
+                            │
+             ┌──────────────▼───────────────────┐
+             │  LLM 生成（chat template + stream)│  core.py
+             └──────────────┬───────────────────┘
+                            │
+             ┌──────────────▼───────────────────┐
+  Layer 3 ─▶ │  CodeSanitizer (sanitize())      │  sanitizer.py
+             │  ① 剥 cuda_runtime.h / cuda.h    │
+             │  ② 剥 markdown ``` fence         │
+             │  ③ <<<>>> → hipLaunchKernelGGL   │
+             └──────────────┬───────────────────┘
+                            │
+             ┌──────────────▼───────────────────┐
+             │  子进程沙盒编译 + 验证 + 测速     │  core.py (subprocess)
+             │  dtype-aware MSE threshold        │
+             │  steady-state timing (median)     │
+             └──────────────┬───────────────────┘
+                            │
+             ┌──────────────▼───────────────────┐
+             │  rocprofv3 硬件反馈 → LLM 迭代   │  profiler.py + core.py
+             │  max_iters=10, temp 0.30→1.65    │
+             └──────────────┬───────────────────┘
+                            │
+             ┌──────────────▼───────────────────┐
+             │  持久化缓存                       │  ~/.rocm_jit_agent_cache/
+             │  {MD5(src+target+shape+sk)}.cpp   │
+             └──────────────────────────────────┘
+```
 
-### 3.2 实测能力上限
+### 3.1 Layer 1: TaskClassifier (`classify()`)
 
-| 任务类型 | 表现 | 数据来源 |
-|---|---|---|
-| 简单 elementwise 融合（`(x*w)*sigmoid(x)+b`） | **首轮成功**，47.8us（3.4x 超 torch.compile） | example_fusion.py |
-| 复杂数学融合（log/abs/tanh/sigmoid/pow 多项） | **首轮成功**，54.5us（4.3x 超 torch.compile） | complex_fusion.py |
-| 1D 广播算子 | 必须在 prompt 中给出**具体维度**（如 `pid % 4096`），否则模型无法泛化 | 实验回归记录 |
-| 编译错误自我修复 | 必须看到**真实的编译器错误信息**，否则 10 轮迭代仍卡住 | 早期 bug 现象 |
+**输入**：`SkeletonContext`（函数名、源码、target、tensor_args、scalar_args、arg_names）+ 可选 `user_hint`
 
-### 3.3 模型脆弱点
+**输出**：`(Skeleton, confidence: float, reason: str)`
 
-1. **对抽象占位符敏感**：`pid % <dim_size>` 这种抽象写法会让模型放弃，必须给具体数值
-2. **错误信息容量有限**：超过几行的错误反馈会被忽略，超长 hipcc 命令会污染 context
-3. **kernel 参数声明易遗漏**：早期版本用 `/* POINTER ARGS HERE */` 占位符，模型 100% 会写出 `error: use of undeclared identifier 'x_ptr'`
-4. **不会自主选择 grid 维度**：所有生成的代码都是 1D grid（依赖骨架），高维 grid 几乎不会出现
+| confidence | 含义 |
+|---|---|
+| 1.00 | 用户通过 `skeleton=...` 显式指定 |
+| 0.90 | 结构化匹配（multi-output 返回值 / matmul op + 2D / reduction-with-dim） |
+| 0.50 | 默认 fallthrough（无正面信号，选 elementwise_1d） |
+| ≤0.30 | 源码含 `_DATA_DEP_PATTERNS` 中的数据依赖算子（cumsum/sort/scatter/gather 等），当前无骨架能正确表达 |
 
----
+当 `confidence < 0.5` 时，`core.py` 打印 `⚠️ LOW CLASSIFIER CONFIDENCE` 警告。
 
-## 4. 当前硬编码清单（设计权衡）
+**分类规则优先级**：
+1. `user_hint` → 直接映射（1.00）
+2. 多返回值（AST 检测）→ `multi_output`（0.90）
+3. `torch.matmul / torch.mm / @` + 输入均 ≥2D → `matmul_2d`（0.90）
+4. `.sum(dim= / .mean(dim= / .max(dim= / .min(dim= / .prod(dim= / .norm(dim=` + 输入 ≥2D → `row_reduction`（0.90）
+5. 检查 `_DATA_DEP_PATTERNS` → `elementwise_1d`（0.30 + 警告）
+6. 默认 → `elementwise_1d`（0.50）
 
-不是所有硬编码都是 bug，部分是为了配合 4B 小模型能力做的工程妥协。下表标注每项是否影响通用性：
+### 3.2 Layer 2: SkeletonRegistry（4 个内置骨架）
 
-### 4.1 模型与硬件耦合
-
-| 硬编码项 | 位置 | 通用性影响 | 说明 |
-|---|---|---|---|
-| 默认 target=`gfx1100` | core.py L8 | 中 | 可参数化，但 prompt 中 target 未深度引导其他架构特性 |
-| 模型路径 `models/Jan-code-4b-gfx1100-HIP-1` | core.py L139 | 高 | 写死 RL 微调的专用模型 |
-| `bfloat16` 加载 | core.py L160 | 低 | RDNA3 合理默认 |
-
-### 4.2 算子约束（最影响通用性）
-
-| 硬编码项 | 位置 | 通用性影响 | 说明 |
-|---|---|---|---|
-| 1D grid 骨架 `pid = blockIdx.x * blockDim.x + threadIdx.x` | core.py L193 | **极高** | 强制 elementwise 思路，不支持 reduction/matmul/conv |
-| `int threads = 256` | core.py L202 | 中 | 合理默认 |
-| `auto output = torch::empty_like({arg_names[0]})` | core.py L200 | **极高** | 假设单输出 + 与第一张量同 shape 同 dtype |
-| `output.data_ptr<float>()` | core.py L204 | **高** | 输出写死 float，dtype 不匹配即崩溃 |
-| kernel 名 `fused_kernel`、函数名 `optimized_func` | core.py | 低 | 工程约定 |
-
-### 4.3 验证与迭代策略
-
-| 硬编码项 | 位置 | 通用性影响 | 说明 |
-|---|---|---|---|
-| MSE 阈值 `1e-3` | core.py | 低 | 对 fp32 合理 |
-| `max_iters = 10` | core.py L135 | 低 | 经验值 |
-| 温度 `0.30 + 0.15*i` | core.py L167 | 低 | 线性递增 |
-| 子进程 `timeout=90s` | core.py | 中 | 大 kernel 可能不够 |
-| 缓存路径 `~/.rocm_jit_agent_cache/` | core.py L101 | 低 | 标准约定 |
-| `max_new_tokens=1024` | core.py | 中 | 大 kernel 会被截断 |
-
-### 4.4 v0.1 → v0.2 已修复清单
-
-| 项 | v0.1 | v0.2 |
-|---|---|---|
-| dtype 支持 | 写死 float* | 动态映射（float/double/half/bf16/int*/bool） |
-| 标量参数 | 全部当 Tensor 崩溃 | 自动区分张量/标量 |
-| 广播提示 | 写死 `pid % 4096` | 按实际 1D 张量生成具体数值 |
-| 缓存哈希 | 仅 源码+target | 加入 shape+dtype |
-| 编译错误反馈 | 被 hipcc 命令行吞掉 | 过滤命令行保留 error 行 |
-| MSE 错误反馈 | 仅数值 | 附带期望/实际前 5 个值 |
-| 性能反馈 | 写死"float4/coalescing" | 仅传 rocprofv3 硬件指标 |
-| 骨架占位符 | `/* POINTER ARGS HERE */` | 具体参数声明 |
-
----
-
-## 5. 模型边界探测实验
-
-> 本节结果来自 `experiments/probe_boundaries.py`（见 §6），在 gfx1100 上用当前模型实际推理生成内核。
-
-（此处将由 `probe_boundaries.py` 运行后自动追加结果。）
-
----
-
-## 6. 通用 JIT 外壳的设计（基于边界探测结论）
-
-（此处将基于探测结果填写。）
-
-
-## 5. 模型边界探测实验（实测）
-
-本节由 `experiments/probe_boundaries.py` + `experiments/sanitize_and_retry.py` 实测得出。模型每个探测任务只生成 1 次（不迭代），后再加 3 个轻量级后处理器尝试编译运行。
-
-### 5.1 探测任务与结果
-
-| 探测任务 | 规模 | 首次生成是否编译通过 | 经 3 个 sanitizer 后 | 算法正确性 |
+| Skeleton | 返回类型 | Grid 策略 | Prompt 特化 | Eval 特化 |
 |---|---|---|---|---|
-| **Row-wise sum** (reduction + 输出形状变化) | x[64,128]→out[64] | ❌ | ✅ **PASS** | MSE=0.000000 |
-| **2D matmul** (2D grid + 三层循环) | [32,64]×[64,32] | ❌ | ✅ **PASS** | MSE=0.000000 |
-| **Row-wise softmax** (带 shared memory reduction) | [16,256] | ❌ | ❌ RUN_FAIL | 编译通过但 reduce 逻辑有 bug |
-| **Multi-output** (返回 `std::vector<Tensor>`) | x,y[1024]→(x+y, x-y) | ❌ | ✅ **PASS** | MSE=0.000000 |
+| `elementwise_1d` | `torch::Tensor` | 1D: `(n+255)/256, 256` | `pid = blockIdx.x * blockDim.x + threadIdx.x` | 全局 MSE |
+| `row_reduction` | `torch::Tensor` | 1D: `rows, blockDim` | 一个 block 处理一行，shared memory 累加 | 逐行对比 |
+| `matmul_2d` | `torch::Tensor` | 2D: `(N+15)/16, (M+15)/16` 各 `16×16` | C[i][j] = dot(A[i,:], B[:,j]) | MSE ≤ MATMUL_MSE_THRESH |
+| `multi_output` | `std::vector<torch::Tensor>` | 继承 elementwise_1d | 多个输出指针声明 | 每个输出独立 MSE |
 
-### 5.2 失败根因分析
+每个 Skeleton 是一个 dataclass，包含：
+- `build_prompt_block(ctx, sk) → str`：生成 LLM user message（含具体 dtype、shape、C++ 签名模板）
+- `build_eval_compare(ctx, sk) → str`：生成子进程中的验证 Python 代码
+- `signature_regex`：从生成的 C++ 中提取 `optimized_func` 原型
+- `cpp_return_type`、`n_outputs`、`description`
 
-4 个任务**首次全部编译失败**，但失败根因 **不在模型的算法能力**，而在 3 类低层级表面问题：
+### 3.3 Layer 3: CodeSanitizer (`sanitize()`)
 
-| 表面问题 | 出现任务 | 修复难度 |
+确定性后处理，修复 3 类已知模型 surface bug：
+
+| 规则 | 触发条件 | 修复 |
 |---|---|---|
-| 模型在 HIP 代码里带入 `#include <cuda_runtime.h>` / `#include <cuda.h>` | 4/4 | 正则替换 1 行 |
-| 模型在代码尾部保留 markdown 的 ``` fence | 4/4 | 行过滤 1 行 |
-| 模型用 CUDA 风格 `kernel<<<grid,block>>>(args)` 启动语法 | softmax / multi_output | 正则改写 1 条 |
+| Strip CUDA headers | `#include <cuda_runtime.h>` / `<cuda.h>` / `<device_launch_parameters.h>` / `<cuda_runtime_api.h>` | 注释化 |
+| Strip markdown fences | 行首 ``` | 删除该行 |
+| Rewrite launch syntax | `kernel<<<grid,block>>>(args);` | `hipLaunchKernelGGL(kernel, grid, block, 0, 0, args);` |
 
-### 5.3 结论：模型真正的能力边界
-
-**模型 _能_ 做（只要 skeleton 正确）：**
-1. **任意输出形状**：`torch::empty({rows}, x.options())` 类分配，模型可自行推理
-2. **Reduction / inner loop**：单线程循环累加（64×128 一次通过）
-3. **2D grid**：给出 `dim3(x,y)` skeleton 后能写出 `blockIdx.y*... + threadIdx.y`
-4. **2D 索引**：正确写出 `A[i*K+k] * B[k*N+j]`（教科书式 naive matmul）
-5. **Multi-output**：能返回 `std::vector<torch::Tensor>{a, b}` 并同时写两个输出指针
-6. **Shared memory 声明**：能写出 `__shared__ float sdata[256]`
-
-**模型 _不稳定_ 的地方：**
-1. **Shared memory reduction 算法**：softmax 的 block reduce 写错（将 `val` 累加而非 `expf(val)`）
-2. **Warp / wavefront 原语**：未测试，但训练数据可能不足
-3. **数值稳定性细节**：softmax 的 max-subtraction 位置写错
-
-**模型 _系统性 bug_（需外壳处理）：**
-1. 无脑插入 `cuda_runtime.h`
-2. 保留输出 markdown fence
-3. 使用 CUDA 三尖括号启动语法
-
-### 5.4 与当前 core.py 能力的对比
-
-当前 `core.py` 的迭代循环中如果遇到 `cuda_runtime.h` 报错，模型确实会在下一轮看到 error 并自我修正。但每轮要 30 秒推理 + 60 秒编译，**用正则 1 次性 sanitize 能省 1-3 轮迭代**。真正的瓶颈从来不是模型能力，而是外壳的 skeleton 选择。
+返回 `(cleaned_code, patches_applied: List[str])`，patches 会打印到日志。
 
 ---
 
-## 6. 通用 JIT 外壳设计：从"elementwise 专用"到"可插拔骨架"
+## 4. 核心数据流详解
 
-### 6.1 架构愿景
-
-把当前硬编码的 1D elementwise skeleton 升级为 **"任务分类器 + 骨架库 + 通用后处理器"** 三层架构。
-
-```
-               ┌─────────────────────────────────┐
-     用户 ── ▶ │   @optimize 装饰器（不变）      │
-               └──────────────┬──────────────────┘
-                              │
-               ┌──────────────▼──────────────────┐
-  NEW  ──────▶ │  任务分类器 (TaskClassifier)   │
-               │  基于源码 AST + 输入/输出 shape │
-               │  分类为: elementwise / reduce  │
-               │        matmul / 2d-stencil ... │
-               └──────────────┬──────────────────┘
-                              │
-               ┌──────────────▼──────────────────┐
-  NEW  ──────▶ │  骨架库 (SkeletonRegistry)     │
-               │  每类任务有一套 prompt + skele │
-               │  + 输出 alloc 模板 + eval 模板 │
-               └──────────────┬──────────────────┘
-                              │
-               ┌──────────────▼──────────────────┐
-               │  LLM 生成（不变）              │
-               └──────────────┬──────────────────┘
-                              │
-               ┌──────────────▼──────────────────┐
-  NEW  ──────▶ │  通用代码后处理 (CodeSanitizer)│
-               │  - 剥 cuda_runtime.h / cuda.h  │
-               │  - 剥尾部 markdown fence       │
-               │  - <<<>>> → hipLaunchKernelGGL │
-               │  - 补齐 <cmath>, FLT_MAX 等    │
-               └──────────────┬──────────────────┘
-                              │
-               ┌──────────────▼──────────────────┐
-               │  子进程沙盒（不变）            │
-               │  + eval 模板随骨架切换         │
-               └─────────────────────────────────┘
-```
-
-### 6.2 核心抽象：Skeleton 数据类
+### 4.1 签名解析与参数分离
 
 ```python
-@dataclass
-class Skeleton:
-    name: str                         # "elementwise_1d" / "row_reduction" / "matmul_2d" / ...
-    match: Callable[[FnSig], bool]    # 判断是否适用
-    output_alloc: Callable[[FnSig], str]    # 生成 C++ 输出分配代码
-    kernel_skeleton: Callable[[FnSig], str] # 生成 kernel 模板（带 TODO 注释）
-    launch_skeleton: Callable[[FnSig], str] # 生成 hipLaunchKernelGGL 代码
-    eval_template: Callable[[FnSig], str]   # 生成子进程中的 MSE 验证脚本
-    extra_prompt_hints: List[str]     # 给 LLM 的额外提示（如 "use shared memory"）
+# core.py wrapper() 内
+arg_names = inspect.signature(func).parameters.keys()
+tensor_args = [(name, arg) for ...]   # isinstance(arg, torch.Tensor)
+scalar_args = [(name, arg) for ...]   # int / float / bool
 ```
 
-### 6.3 内置骨架最小集（MVP）
+标量参数自动映射 C++ 类型：`float→float`, `int→int`, `bool→bool`（`scalar_to_ctype()`）。
+张量 dtype 映射：`torch.float32→float`, `torch.float16→at::Half`, `torch.bfloat16→at::BFloat16` 等（`dtype_to_ctype()`，10 种 dtype 覆盖）。
 
-基于 §5 的实测，以下 4 个骨架即可覆盖常见场景：
+### 4.2 基准测速
 
-| Skeleton | 适用条件 | 输出 alloc 模板 | Grid 模板 |
+使用 `_robust_bench_us(fn)` —— 通用 steady-state GPU 计时：
+1. 25 次 warmup 调用
+2. 5 轮 × 100 次迭代，每轮用 `torch.cuda.Event` 计时
+3. 取 5 轮的中位数（微秒）
+
+同时用于 eager baseline、torch.compile baseline 和子进程内核评估。替代了早期的 single-shot 计时，解决了 cold-cache bias 导致 speedup 虚高的问题。
+
+验证：`stability_test.py` 确认内部报告 eager=27.4us 与外部 200 次重复中位数 26.8us 一致。
+
+### 4.3 缓存键
+
+```python
+shape_sig = str([(list(a.shape), str(a.dtype)) for a in args if isinstance(a, torch.Tensor)])
+func_hash = MD5(source_code + target + shape_sig + sk.name + str(sk.n_outputs))
+```
+
+不同 shape → 不同 key → 不同内核。不支持动态 shape。
+
+### 4.4 dtype-aware 验证阈值
+
+`_pick_mse_threshold(tensor_infos)` 根据输入中最低精度 dtype 自动选择阈值：
+
+| dtype | MSE 阈值 |
+|---|---|
+| float64 | 1e-6 |
+| float32 | 1e-3 |
+| float16 | 5e-2 |
+| bfloat16 | 1e-1 |
+| int* / bool | 0.0（精确匹配） |
+
+matmul 骨架额外使用 `max(threshold, 1e-1)` 作为 floor。
+
+### 4.5 迭代策略
+
+- `max_iters = 10`，温度从 0.30 每轮递增 0.15（到 1.65）
+- **成功 → 达标（≤ target_us）则立即退出 + 缓存**
+- **成功但未达标** → rocprofv3 硬件反馈注入下一轮 prompt
+- **编译失败** → 提取 hipcc error 行注入下一轮
+- **数值错误** → 注入期望/实际前 5 个值 + MSE
+- **10 轮全败** → 保留原始 PyTorch 函数（graceful fallback），不抛异常
+
+---
+
+## 5. 模型能力评估
+
+### 5.1 RL 模型 vs 基座模型 消融对比
+
+使用 14 个例子全量冷启动（清空缓存），RL 模型 = `Jan-code-4b-gfx1100-HIP-1`，基座 = `Jan-code-4b`。
+
+| 指标 | RL 模型 | 基座模型 | 差异 |
 |---|---|---|---|
-| `elementwise_1d` | 所有输入张量 shape 相同且输出与输入 shape 相同 | `empty_like(x)` | `dim3((n+255)/256), dim3(256)` |
-| `row_reduction` | 输入 [B,N] 输出 [B] 或 [B,1] | `empty({rows}, x.options())` | `dim3(rows), dim3(256)` |
-| `matmul_2d` | 两个 2D 输入 且 输出形状为 (A.rows, B.cols) | `empty({M,N}, A.options())` | `dim3((N+15)/16, (M+15)/16), dim3(16,16)` |
-| `multi_output` | 函数返回 tuple | 多个 `empty_like` | 继承上述一种 |
+| **达标数** (beat min(eager, compile)) | **7/14** | 4/14 | **RL +75%** |
+| **完全失败** (10 轮全败退回 PyTorch) | **0/14** | 1/14 | RL 更稳 |
+| 平均迭代数 | 6.8 | 7.4 | RL 少 0.6 轮 |
+| **平均失败次数/例** | **1.4** | 3.4 | **RL -59%** |
+| 平均 speedup vs torch.compile (13 个都成功的) | **2.55x** | 1.96x | **RL +30%** |
+| 总编译耗时 | 5011s | 4807s | 基本持平 |
 
-**分类器规则（基于 AST + shape 推断）**：
-- 源码含 `torch.matmul` / `@` 且输入都是 2D → `matmul_2d`
-- 源码含 `.sum(dim=` / `.mean(dim=` / `.max(dim=` → `row_reduction`
-- 函数 `return a, b` 或 `return (a, b, ...)` → `multi_output` 外加基础类
-- 默认 → `elementwise_1d`
+### 5.2 RL 增益集中在 reduction / matmul 场景
 
-### 6.4 通用 CodeSanitizer（§5.2 结论落地）
-
-```python
-class CodeSanitizer:
-    RULES = [
-        # (pattern, replacement, description)
-        (r"#include <cuda_runtime.h>", "// cuda_runtime.h stripped", "rocm"),
-        (r"#include <cuda.h>",         "// cuda.h stripped",          "rocm"),
-        (r"#include <device_launch_parameters.h>", "// stripped", "rocm"),
-        (r"^```.*$", "", "markdown"),              # 行级 regex，多行模式
-        (r"(\w+)\s*<<<([^,]+),([^>]+)>>>\s*\(([^;]*)\)\s*;",
-         r"hipLaunchKernelGGL(\1, \2, \3, 0, 0, \4);", "launch_syntax"),
-        # 可扩展：补 <cmath>, FLT_MAX 等
-    ]
-```
-
-在 §5 实测中，这 4 条规则把 pass 率从 0/4 拉到 3/4。softmax 的失败是**算法层 bug**（需要 LLM 在下一轮看到 MSE 错误修复），不是 sanitizer 能解决的。
-
-### 6.5 输出侧通用化
-
-替换当前写死的 `output.data_ptr<float>()`：
-
-```python
-# 当前（硬编码）
-f"{out_ptr}.data_ptr<float>()"
-
-# 通用：根据推断的输出 dtype 决定
-def output_launch_ptrs(output_sigs):
-    parts = []
-    for out in output_sigs:           # out = (var_name, ctype)
-        parts.append(f"{out.name}.data_ptr<{out.ctype}>()")
-    return ", ".join(parts)
-```
-
-**输出签名推断方法**：
-1. 对 `elementwise_1d`：与第一个输入同 dtype、同 shape（当前做法）
-2. 对 `row_reduction`：与输入同 dtype、shape 去掉 reduce 轴
-3. 对 `matmul_2d`：同 dtype、shape = (A.dim(0), B.dim(-1))
-4. 对 `multi_output`：用户需要在装饰器 kwargs 显式声明，如 `@optimize(outputs=[SameAs("x"), ReduceAlong("x", axis=1)])`
-
-### 6.6 分层反馈策略
-
-不同骨架需要不同的反馈模板：
-
-| 骨架 | 成功标准 | 失败时额外提示 |
-|---|---|---|
-| elementwise_1d | MSE < 1e-3 | 当前通用提示 |
-| row_reduction | MSE < 1e-3 **AND** 逐行对比（不只看全局 MSE） | "reduction 的累加顺序可能影响精度" |
-| matmul_2d | MSE < 1e-1 | "检查 A、B 的行列顺序是 row-major" |
-| multi_output | 每个输出独立 MSE | "第 N 个输出误差大" |
-
-### 6.7 改造 ROI 排序（与 §4 硬编码清单对应）
-
-| 优先级 | 改造项 | 解锁能力 | 工作量（按当前代码） |
+| Example | RL kernel | Base kernel | RL 优势 |
 |---|---|---|---|
-| **P0** | 加入 `CodeSanitizer`（4 条规则） | 绕过现有 1-3 轮无谓迭代 | ~30 行，2 小时 |
-| **P0** | 输出 `data_ptr<{dtype}>` 动态化 | 解锁非 float 输出（当前已支持输入，不支持输出） | ~5 行 |
-| **P1** | `Skeleton` 抽象 + `elementwise_1d` 默认骨架 | 架构铺垫 | ~100 行 |
-| **P1** | 加 `row_reduction` 骨架 + 分类器 | 解锁 sum/mean/norm 类算子 | ~80 行 |
-| **P2** | 加 `matmul_2d` 骨架 | 解锁小矩阵乘（对大矩阵仍输 rocBLAS） | ~80 行 |
-| **P2** | 加 `multi_output` 装饰器签名 + 验证 | 解锁 RNN cell、layernorm 完整版 | ~60 行 |
-| **P3** | 更细的任务分类器（支持 conv / attention） | 需要更强模型配合 | 大 |
+| reduction (.sum) | 4.7us | 22.4us | **4.8x faster** |
+| l2_norm (sqrt(sum(x²))) | 5.3us | 39.4us | **7.4x faster** |
+| matmul | 12.4us | 13.5us | 1.1x faster |
+| example_fusion | 34.5us (PASS) | FAIL (10/10 全败) | RL: 100% vs 0% |
 
-### 6.8 API 兼容性
+RL 训练教会了模型：(a) 用合理的 block size 做 shared memory reduction；(b) 避开常见 HIP C++ 编译陷阱。
 
-所有改造都保持 **向后兼容**：
+### 5.3 两者无差异的场景
+
+简单 elementwise op（fp16/attention_3d/multi_output）两者 1-iter 达标，speedup 相同（4.3-4.8x）。基座模型本身就有足够的 elementwise HIP kernel 知识。
+
+### 5.4 模型能力边界（RL 和基座共同的天花板）
+
+**能做：**
+- 任意 elementwise 融合（含 tanh/sigmoid/exp/pow/sqrt 等超越函数）
+- 简单 shared memory reduction（sum/mean/norm，RL 模型更可靠）
+- Naive matmul（for 循环逐元素累加，不会跑赢 rocBLAS）
+- Multi-output kernel（`std::vector<torch::Tensor>`）
+- 正确的 dtype 处理（fp32/fp16/bf16 各用正确的 C++ 类型）
+- 超出 skeleton 范围的简单算子（如 cumsum — 模型忽略 elementwise 提示写了正确的 prefix sum）
+
+**不能做：**
+- Tiling / vectorized load（float4）/ memory coalescing 优化
+- Warp/wavefront-level reduction（`__shfl_xor_sync` 等内在函数）
+- Flash-style attention（多 kernel 编排）
+- 动态 shape kernel（shape 值硬编码在生成的内核中）
+- 大 tensor 高性能（numel ≥ 4M 系统性输给 torch.compile）
+
+**模型 3 类系统性 surface bug（由 Sanitizer 处理）：**
+1. 插入 `#include <cuda_runtime.h>` / `<cuda.h>`
+2. 保留 markdown ``` fence
+3. 使用 CUDA `<<<>>>` 启动语法
+
+### 5.5 性能分布
+
+| 场景 | vs torch.compile | vs eager | 备注 |
+|---|---|---|---|
+| 小 tensor (numel ≤ 1M) | **1.8–4.7x** | 2–19x | torch.compile 有固定 launch overhead |
+| 大 tensor (numel ≥ 4M) | **0.6–0.9x** | 1.5–3x | 模型只能生成 naive per-thread kernel |
+
+---
+
+## 6. 全量测试结果（RL 模型，v1.0）
+
+14 例全部清缓存冷启动，所有例子正确性 100% 通过（MSE=0 或在 dtype 容差内）。
+
+| # | Example | Skeleton | Conf | dtype | shape | Iters | Fails | 达标 | Eager | tc | Opt | Speedup vs tc | Wall |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | example_fusion | elem_1d | 0.50 | fp32 | 2D | 10 | 0 | ✨ | 109us | 25us | 35us | 0.7x | 558s |
+| 2 | complex_fusion | elem_1d | 0.50 | fp32 | 2D | 10 | 0 | ✨ | 691us | 47us | 58us | 0.8x | 626s |
+| 3 | gelu | elem_1d | 0.50 | fp32 | 2D | 10 | 1 | ✨ | 1479us | 57us | 77us | 0.7x | 519s |
+| 4 | swiglu | elem_1d | 0.50 | fp32 | 2D | 10 | 2 | ✨ | 247us | 42us | 47us | 0.9x | 530s |
+| 5 | silu_bf16 | elem_1d | 0.50 | **bf16** | 2D | 10 | 4 | ✨ | 41us | 22us | 33us | 0.7x | 489s |
+| 6 | fp16 | elem_1d | 0.50 | **fp16** | 2D | 1 | 0 | **🏆** | 9us | 20us | **4us** | **4.7x** | 59s |
+| 7 | scaled_activation | elem_1d | 0.50 | fp32 | 2D | 10 | 0 | ✨ | 62us | 23us | 30us | 0.8x | 504s |
+| 8 | attention_3d | elem_1d | 0.50 | fp32 | **3D** | 1 | 0 | **🏆** | 8us | 21us | **5us** | **4.3x** | 62s |
+| 9 | reduction | row_red | 0.90 | fp32 | 2D | 2 | 0 | **🏆** | 8us | 20us | **5us** | **4.3x** | 111s |
+| 10 | l2_norm | row_red | 0.90 | fp32 | 2D | 10 | 7 | **🏆** | 20us | 21us | **5us** | **3.9x** | 433s |
+| 11 | matmul | matmul_2d | 0.90 | fp32 | 2D | 9 | 1 | **🏆** | 13us | 46us | **12us** | **3.7x** | 504s |
+| 12 | multi_output | multi_out | 0.90 | fp32 | 1D | 1 | 0 | **🏆** | 8us | 22us | **5us** | **4.2x** | 59s |
+| 13 | cumsum (负例) | elem_1d | **0.30** | fp32 | 2D | 10 | 4 | ✨ | 6us | 21us | 9us | 2.3x | 496s |
+| 14 | stability_test | elem_1d | 0.50 | fp32 | 2D | 1 | 0 | **🏆** | 27us | 22us | **12us** | **1.8x** | 61s |
+
+- 🏆 = 达成 target_us（≤ min(eager, compile)）：7/14
+- ✨ = 编译成功取最优但未达标：7/14
+- ❌ = 全部失败：0/14
+- 平均编译耗时：~360s/例（1-iter 达标 ~60s，10-iter 耗尽 ~530s）
+
+---
+
+## 7. 工程实现细节
+
+### 7.1 dtype 全链路支持
+
+| 环节 | 实现 |
+|---|---|
+| 输入 dtype → C++ 类型 | `dtype_to_ctype()`：10 种 dtype → C type 映射 |
+| 标量参数 → C++ 类型 | `scalar_to_ctype()`：bool/int/float |
+| Prompt 中的 dtype 提示 | 骨架自动嵌入具体的 `data_ptr<at::BFloat16>()` 等 |
+| 验证阈值 | `_pick_mse_threshold()`：按最低精度 dtype 自动选择 |
+| 输出分配 | `torch::empty_like(input[0])` 继承 dtype（elementwise） |
+
+### 7.2 缓存机制
+
+- 路径：`~/.rocm_jit_agent_cache/`
+- 文件：`{hash}.cpp`（HIP 内核源码）+ `{hash}_sig.cpp`（C++ 函数签名）
+- 命中时：直接 `load_inline` 加载，跳过 LLM 推理和编译
+- 失效条件：源码修改、target 改变、输入 shape/dtype 改变、skeleton 改变
+- `force_recompile=True` 可强制跳过缓存
+
+### 7.3 LLM 推理
+
+- 加载：`AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, device_map="auto")`
+- 生成：`max_new_tokens=1024`, `top_p=0.95`, `do_sample=True`, 温度递增
+- Prompt 前缀强制：`prompt += "```cpp\n#include <torch/extension.h>\n#include <hip/hip_runtime.h>\n"`
+- 流式输出：`TextStreamer` 子类实时显示生成进度
+- 模型路径：`models/Jan-code-4b-gfx1100-HIP-1`（硬编码，RL 微调版本）
+
+### 7.4 子进程沙盒
+
+- 用 `tempfile.NamedTemporaryFile` 写 eval script
+- `subprocess.run` + `timeout=120s`
+- 内置 `load_inline` 编译 HIP 内核
+- 验证：MSE against original PyTorch function
+- 测速：25 warmup + median of 5×100 (与主进程一致)
+- 输出协议：`SUCCESS:mse:opt_us:build_dir` 或 `ERROR:message`
+
+---
+
+## 8. API 参考
+
 ```python
-# 老用法（不变）
+from rocm_jit_agent import optimize
+
+# 最简用法：自动分类骨架
 @optimize(target="gfx1100")
-def elementwise(x, w, b): return x * w + b
+def my_op(x, w, b):
+    return torch.relu(x * w + b)
 
-# 新用法：显式声明输出签名
-@optimize(target="gfx1100", skeleton="row_reduction",
-          outputs=[OutputSpec(shape_expr="input[0].shape[:-1]", dtype="input[0].dtype")])
-def row_sum(x): return x.sum(dim=-1)
+# 显式指定骨架 + 强制重编译
+@optimize(target="gfx1100", skeleton="row_reduction", force_recompile=True)
+def row_sum(x):
+    return x.sum(dim=-1)
 
-# 新用法：多输出
-@optimize(target="gfx1100", outputs=["same_as_input", "same_as_input"])
-def split(x, y): return x + y, x - y
+# 多输出（自动检测）
+@optimize(target="gfx1100")
+def split_op(x, y):
+    return x + y, x - y
+
+# 带标量参数
+@optimize(target="gfx1100")
+def scaled(x, alpha: float, beta: float):
+    return alpha * torch.relu(x) + beta
 ```
 
-### 6.9 模型不变条件下外壳改造的上限
-
-即使做完 P0-P3 所有改造，以下仍是 4B 模型的能力天花板：
-- **BLAS 性能**：naive matmul 不会跑赢 rocBLAS；需要更大模型或显式提示 MFMA/WMMA 指令
-- **Flash-style attention**：多 kernel 编排超出单文件生成能力
-- **动态 shape**：当前缓存按 shape hash，无法真正动态
-- **稀疏/不规则计算**：topk、CSR spmv 等
-
-但在 **"给定 shape 的稠密算子融合"** 这一主流场景，P0-P3 改造能把通用性从当前的 "elementwise only" 拓展到 **"elementwise + reduction + small matmul + multi-output"**，覆盖 LLM 推理中 ~70% 的自定义算子需求（LayerNorm/RMSNorm/GEGLU/SwiGLU/简单 attention pre-softmax 等）。
+**参数**：
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `target` | str | `"gfx1100"` | GPU 架构标识 |
+| `backend` | str | `"local:..."` | 模型 backend（目前仅本地） |
+| `force_recompile` | bool | `False` | 跳过缓存强制重编译 |
+| `skeleton` | str/None | `None` | 显式指定骨架：`elementwise_1d` / `row_reduction` / `matmul_2d` / `multi_output` |
 
 ---
 
-## 7. 已知局限与风险（承接 v0.2）
+## 9. 已知局限
 
-1. 首次启动慢：4B 模型加载 + HIP 编译，首次约 60-90 秒
-2. 缓存失效条件：源码改动、target 改变、shape/dtype 改变都会触发重生成
-3. 不支持动态 shape
-4. 依赖 ROCm 7.x + PyTorch ROCm 构建
-5. 依赖 `rocprofv3`；缺失时性能反馈降级为只看时序
-6. **§6 改造前的限制**：只支持 1D elementwise；softmax 类需要 shared memory 的算子即使模型能写对也会被外壳拒绝
+| # | 局限 | 影响 | 缓解 |
+|---|---|---|---|
+| 1 | 大 tensor (numel ≥ 4M) 系统性输给 torch.compile | 无法用于大矩阵/大 batch 优化 | 4B 模型的知识边界，需要更大模型或显式 tiling 模板 |
+| 2 | 冷启动慢（1-iter: ~60s, 10-iter: ~530s） | 不适合真正的 JIT 场景 | 依赖缓存；缓存命中后 O(1) 加载 |
+| 3 | 不支持动态 shape | shape 变化触发重编译 | cache key 含 shape_sig |
+| 4 | 分类器基于源码 regex | lambda / 装饰链 / 跨文件 helper 失效 | `skeleton=...` 显式指定 |
+| 5 | 子进程 benchmark 仍有 ~10% 波动 (CV=0.117) | 边界处的达标/未达标判定不稳定 | 已用 median-of-5-rounds 缓解 |
+| 6 | 依赖 ROCm 7.x + PyTorch ROCm 构建 | 无法在 CUDA 环境运行 | 项目定位即为 ROCm 专用 |
+| 7 | 依赖 `rocprofv3`；缺失时性能反馈降级 | 迭代优化效果下降 | 仍可通过时序反馈迭代 |
+| 8 | 模型路径硬编码 | 更换模型需改 core.py | 未来可参数化到 backend 字段 |
+
+---
+
+## 10. 版本历史
+
+| 版本 | 主要变更 |
+|---|---|
+| v0.1 | 初始实现：单一 elementwise 骨架，写死 float dtype，2 个例子 |
+| v0.2 | dtype 动态化、标量参数支持、广播提示、编译错误过滤、MSE 反馈增强 |
+| **v1.0** | **三层架构**（分类器 + 4 骨架 + Sanitizer）；**14 个测试例子**覆盖 4 骨架 × 3 dtype × 3 维度；**稳态计时**（median-of-rounds 替代 single-shot）；**dtype-aware MSE 阈值**；**分类器置信度** + 低置信度警告 + 数据依赖检测；**RL vs 基座模型消融对比**（RL +75% 达标率、-59% 编译失败率、+30% 平均 speedup）；**graceful fallback**（10 轮全败保留原 PyTorch）|
